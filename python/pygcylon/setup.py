@@ -201,7 +201,7 @@ setup(
         find_packages(include=["pygcylon*"]), ["*.pxd"],
     ),
     python_requires='>=3.7',
-    install_requires=["cython", "numpy", "llama-index-core", "langchain-text-splitters"],
+    install_requires=["cython", "numpy", "llama-index-core", "langchain-text-splitters"],  # cudf must be installed via conda
     zip_safe=False,
 )
 print("PyGcylon setup done!")
