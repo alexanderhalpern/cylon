@@ -13,7 +13,7 @@
 ##
 
 '''
-RAG ingestion pipeline demo: Load -> Split -> Embed -> L2 Normalize -> Upsert
+RAG pipeline demo: Load -> Split -> Embed -> L2 Normalize -> Upsert -> Retrieve -> Rerank
 
 # local (single GPU):
 python python/pygcylon/examples/rag.py
@@ -30,7 +30,7 @@ import cudf
 import numpy as np
 import pycylon as cy
 import pygcylon as gcy
-from pygcylon.rag import token_split, embed, l2_normalize, upsert
+from pygcylon.rag import token_split, embed, l2_normalize, upsert, retrieve, rerank
 
 from llama_index.core.embeddings import MockEmbedding
 import chromadb
@@ -52,7 +52,7 @@ docs = gcy.DataFrame.from_cudf(cudf.DataFrame({
 if rank == 0:
     print(f"RAG pipeline: {ws} worker(s), {num_docs} docs")
     print("=" * 60)
-    print("\n[Pipeline] load -> split -> embed -> l2_normalize -> upsert")
+    print("\n[Ingest] load -> split -> embed -> l2_normalize -> upsert")
 
 embed_model = MockEmbedding(embed_dim=384)
 chroma_client = chromadb.Client()
@@ -90,5 +90,25 @@ if rank == 0:
     print(f"  total:     {total:.4f}s")
     print(f"  throughput: {num_docs / total:.1f} docs/s")
     print(f"\n[Verify] collection.count() = {collection.count()}")
+
+    print("\n[Retrieval] query='machine learning GPU'")
+    t0 = time.perf_counter()
+    results = retrieve("machine learning GPU", collection, embed_model, top_k=5)
+    timings["retrieve"] = time.perf_counter() - t0
+    print(f"  retrieve:  {timings['retrieve']:.4f}s  ({len(results['ids'][0])} results)")
+
+    def mock_reranker(query, docs):
+        return [len(d) for d in docs]
+
+    t0 = time.perf_counter()
+    ranked = rerank("machine learning GPU", results, mock_reranker, top_k=3)
+    timings["rerank"] = time.perf_counter() - t0
+    print(f"  rerank:    {timings['rerank']:.4f}s  (top {len(ranked)})")
+
+    print("\n[Top 3 Results]")
+    for i, r in enumerate(ranked):
+        preview = r["text"][:60] + "..." if len(r["text"]) > 60 else r["text"]
+        print(f"  {i+1}. doc={r['doc_id']} chunk={r['chunk_idx']} score={r['score']:.1f}")
+        print(f"     {preview}")
 
 env.finalize()

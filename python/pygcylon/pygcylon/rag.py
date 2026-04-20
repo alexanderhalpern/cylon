@@ -231,3 +231,80 @@ def upsert(embedded, collection, env=None, batch_size=256):
         )
 
     return n
+
+
+def retrieve(query, collection, embed_model, top_k=10):
+    """Retrieve top-k similar chunks from a ChromaDB collection.
+
+    Parameters
+    ----------
+    query : str
+        The query text to search for.
+    collection : chromadb.Collection
+        A ChromaDB collection to search.
+    embed_model : llama_index.core.embeddings.BaseEmbedding
+        Embedding model to encode the query.
+    top_k : int
+        Number of results to return.
+
+    Returns
+    -------
+    dict
+        ChromaDB query results with keys: ids, documents, metadatas, distances.
+    """
+    query_emb = embed_model.get_text_embedding(query)
+    norm = np.linalg.norm(query_emb)
+    if norm > 0:
+        query_emb = (np.array(query_emb) / norm).tolist()
+
+    results = collection.query(
+        query_embeddings=[query_emb],
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"],
+    )
+    return results
+
+
+def rerank(query, results, reranker, top_k=None):
+    """Rerank retrieval results using a cross-encoder or similar model.
+
+    Parameters
+    ----------
+    query : str
+        The original query text.
+    results : dict
+        ChromaDB query results from retrieve().
+    reranker : callable
+        A reranker with signature: reranker(query, documents) -> list[float] scores.
+        Can be a LlamaIndex SentenceTransformerRerank or similar.
+    top_k : int, optional
+        Return only top_k after reranking. If None, return all.
+
+    Returns
+    -------
+    list[dict]
+        Reranked results as list of {doc_id, chunk_idx, text, score}.
+    """
+    docs = results["documents"][0] if results["documents"] else []
+    metas = results["metadatas"][0] if results["metadatas"] else []
+
+    if not docs:
+        return []
+
+    scores = reranker(query, docs)
+
+    ranked = []
+    for i, (doc, meta, score) in enumerate(zip(docs, metas, scores)):
+        ranked.append({
+            "doc_id": meta.get("doc_id"),
+            "chunk_idx": meta.get("chunk_idx"),
+            "text": doc,
+            "score": float(score),
+        })
+
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+
+    if top_k is not None:
+        ranked = ranked[:top_k]
+
+    return ranked
