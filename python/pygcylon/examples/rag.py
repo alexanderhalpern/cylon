@@ -13,6 +13,8 @@
 ##
 
 '''
+RAG ingestion pipeline demo: Load -> Split -> Embed -> L2 Normalize -> Upsert
+
 # local (single GPU):
 python python/pygcylon/examples/rag.py
 
@@ -28,7 +30,10 @@ import cudf
 import numpy as np
 import pycylon as cy
 import pygcylon as gcy
-from pygcylon.rag import token_split, sentence_split, recursive_split, normalize
+from pygcylon.rag import token_split, embed, l2_normalize, upsert
+
+from llama_index.core.embeddings import MockEmbedding
+import chromadb
 
 env = cy.CylonEnv(config=cy.MPIConfig(), distributed=True)
 rank, ws = env.rank, env.world_size
@@ -44,25 +49,46 @@ docs = gcy.DataFrame.from_cudf(cudf.DataFrame({
     "text": cudf.Series(texts, dtype="str"),
 }))
 
-ops = {
-    "token_split": lambda: token_split(docs, env, chunk_size=50),
-    "sentence_split": lambda: sentence_split(docs, env, chunk_size=200),
-    "recursive_split": lambda: recursive_split(docs, env, chunk_size=200),
-    "normalize": lambda: normalize(docs, env),
-}
+if rank == 0:
+    print(f"RAG pipeline: {ws} worker(s), {num_docs} docs")
+    print("=" * 60)
+    print("\n[Pipeline] load -> split -> embed -> l2_normalize -> upsert")
+
+embed_model = MockEmbedding(embed_dim=384)
+chroma_client = chromadb.Client()
+collection = chroma_client.get_or_create_collection(f"rag_demo_{rank}")
+
+timings = {}
+
+t0 = time.perf_counter()
+chunks = token_split(docs, env, chunk_size=50)
+timings["split"] = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+embedded = embed(chunks, embed_model, env, batch_size=64)
+timings["embed"] = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+normalized = l2_normalize(embedded, env)
+timings["l2_norm"] = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+n_upserted = upsert(normalized, collection, env, batch_size=256)
+timings["upsert"] = time.perf_counter() - t0
+
+total = sum(timings.values())
 
 if rank == 0:
-    print(f"RAG ops benchmark: {ws} worker(s), {num_docs} docs")
-    print(f"{'op':<25} {'time(s)':<10} {'docs/s':<10}")
-    print("-" * 45)
-
-for name, fn in ops.items():
-    fn()
-    t0 = time.perf_counter()
-    result = fn()
-    t = time.perf_counter() - t0
-    if rank == 0:
-        n = len(result.to_cudf())
-        print(f"{name:<25} {t:<10.4f} {num_docs/t:<10.1f}  ({n} chunks)")
+    n_chunks = len(normalized.to_cudf())
+    sample_emb = normalized.to_cudf()["embedding"].iloc[0]
+    emb_norm = float(np.linalg.norm(sample_emb)) if sample_emb is not None else 0.0
+    print(f"  split:     {timings['split']:.4f}s  ({n_chunks} chunks)")
+    print(f"  embed:     {timings['embed']:.4f}s  (dim=384)")
+    print(f"  l2_norm:   {timings['l2_norm']:.4f}s  (norm={emb_norm:.4f})")
+    print(f"  upsert:    {timings['upsert']:.4f}s  ({n_upserted} vectors)")
+    print(f"  --------------------------")
+    print(f"  total:     {total:.4f}s")
+    print(f"  throughput: {num_docs / total:.1f} docs/s")
+    print(f"\n[Verify] collection.count() = {collection.count()}")
 
 env.finalize()

@@ -141,3 +141,93 @@ def normalize(docs, env=None, unicode_form="NFC", lowercase=True,
 
     local["text"] = col
     return gcy.DataFrame.from_cudf(local)
+
+
+def embed(chunks, embed_model, env=None, batch_size=64):
+    """Distributed batch embedding using a LlamaIndex BaseEmbedding model.
+
+    Parameters
+    ----------
+    chunks : gcy.DataFrame
+        Output of any splitter: columns doc_id, chunk_idx, chunk_text.
+    embed_model : llama_index.core.embeddings.BaseEmbedding
+        Any LlamaIndex-compatible embedding model.
+    env : CylonEnv, optional
+        Distributed environment. Single-process if None.
+    batch_size : int
+        Texts per embedding API call.
+
+    Returns
+    -------
+    gcy.DataFrame
+        Input columns plus an ``embedding`` list column (float32).
+    """
+    local = _distribute(chunks, env).to_cudf()
+    texts = local["chunk_text"].to_pandas().tolist()
+
+    embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        batch_embs = embed_model.get_text_embedding_batch(batch)
+        embeddings.extend(batch_embs)
+
+    local["embedding"] = cudf.Series(embeddings)
+    return gcy.DataFrame.from_cudf(local)
+
+
+def l2_normalize(embedded, env=None):
+    """L2 normalize embedding vectors for cosine similarity."""
+    local = _distribute(embedded, env).to_cudf()
+    embs = local["embedding"].to_pandas().tolist()
+
+    normalized = []
+    for emb in embs:
+        arr = np.array(emb, dtype=np.float32)
+        norm = np.linalg.norm(arr)
+        if norm > 0:
+            arr = arr / norm
+        normalized.append(arr.tolist())
+
+    local["embedding"] = cudf.Series(normalized)
+    return gcy.DataFrame.from_cudf(local)
+
+
+def upsert(embedded, collection, env=None, batch_size=256):
+    """Batch upsert embeddings to a ChromaDB collection.
+
+    Parameters
+    ----------
+    embedded : gcy.DataFrame
+        Output of embed() or l2_normalize(): columns doc_id, chunk_idx, chunk_text, embedding.
+    collection : chromadb.Collection
+        A ChromaDB collection to upsert into.
+    env : CylonEnv, optional
+        Distributed environment. Single-process if None.
+    batch_size : int
+        Vectors per upsert call.
+
+    Returns
+    -------
+    int
+        Number of vectors upserted by this worker.
+    """
+    local = _distribute(embedded, env).to_cudf()
+    n = len(local)
+    if n == 0:
+        return 0
+
+    ids = [f"{int(local['doc_id'].iloc[i])}_{int(local['chunk_idx'].iloc[i])}" for i in range(n)]
+    texts = local["chunk_text"].to_pandas().tolist()
+    embs = local["embedding"].to_pandas().tolist()
+    metadatas = [{"doc_id": int(local["doc_id"].iloc[i]), "chunk_idx": int(local["chunk_idx"].iloc[i])} for i in range(n)]
+
+    for i in range(0, n, batch_size):
+        end = min(i + batch_size, n)
+        collection.upsert(
+            ids=ids[i:end],
+            embeddings=embs[i:end],
+            documents=texts[i:end],
+            metadatas=metadatas[i:end],
+        )
+
+    return n
