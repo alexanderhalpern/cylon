@@ -23,6 +23,7 @@ from .groupby import (
 )
 from . import (
     comms,
+    rag,
 )
 
 from .io import (
